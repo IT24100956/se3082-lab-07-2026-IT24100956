@@ -1,0 +1,117 @@
+================================================================================
+SE3082 - Parallel Computing | Lab 07
+Exercise 04: Replace Gather with Reduce
+================================================================================
+
+1. OBJECTIVE & CODE REFACTORING DETAILS:
+--------------------------------------------------------------------------------
+In Exercise 3, MPI_Gather gathered all partial sums to root, but root still had to
+iterate through the gathered buffer `all_sums` and add them sequentially.
+MPI_Reduce performs both the communication and reduction in a single unified operation.
+
+Key modifications made in sum_reduce.c:
+1. Removed the `all_sums` dynamic buffer allocation and the post-gather summation loop.
+2. Integrated MPI_Reduce:
+   MPI_Reduce(&local_sum, &total_sum, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+3. Efficiency Analysis:
+   MPI_Reduce uses an internal tree-based reduction (e.g., binomial tree or recursive
+   halving-doubling algorithm) running in O(log P) time steps, in contrast to the
+   manual loop on root which requires O(P) additions and O(P) linear gathering memory.
+4. Scope of Result:
+   Note that after MPI_Reduce, `total_sum` contains the valid reduced value ONLY on
+   root (rank 0). On non-root processes, `total_sum` remains uninitialized/invalid.
+
+2. SOURCE CODE (sum_reduce.c):
+--------------------------------------------------------------------------------
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define N 1000000
+
+int main(int argc, char **argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int chunk_size = N / size;
+
+    /* Only root allocates the full array */
+    int *array = NULL;
+    if (rank == 0) {
+        array = (int *)malloc(N * sizeof(int));
+        if (array == NULL) {
+            fprintf(stderr, "Root failed to allocate full array\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        for (int i = 0; i < N; i++)
+            array[i] = i + 1;
+        printf("Root filled array with values 1 to %d\n", N);
+    }
+
+    /* All processes allocate only their small local chunk */
+    int *local_chunk = (int *)malloc(chunk_size * sizeof(int));
+    if (local_chunk == NULL) {
+        fprintf(stderr, "Rank %d failed to allocate local_chunk\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    double start = MPI_Wtime();
+
+    /* Distribute chunks using Scatter */
+    MPI_Scatter(array, chunk_size, MPI_INT,
+                local_chunk, chunk_size, MPI_INT,
+                0, MPI_COMM_WORLD);
+
+    /* Local summation */
+    long long local_sum = 0;
+    for (int i = 0; i < chunk_size; i++)
+        local_sum += local_chunk[i];
+
+    int start_idx = rank * chunk_size;
+    int end_idx = start_idx + chunk_size;
+    printf("  Rank %d: summed indices [%d, %d) => local_sum = %lld\n",
+           rank, start_idx, end_idx, local_sum);
+
+    /*
+     * REDUCE: Combines all local values using MPI_SUM in O(log P) steps
+     * and delivers the final sum directly to root.
+     */
+    long long total_sum = 0;
+    MPI_Reduce(&local_sum, &total_sum, 1, MPI_LONG_LONG,
+               MPI_SUM, 0, MPI_COMM_WORLD);
+
+    /* Output only on root (total_sum is valid only on root) */
+    if (rank == 0) {
+        double elapsed = MPI_Wtime() - start;
+        long long expected = (long long)N * (N + 1) / 2;
+        printf("\n[Reduce] Total sum   = %lld\n", total_sum);
+        printf("[Reduce] Expected    = %lld\n", expected);
+        printf("[Reduce] Correct?    = %s\n", total_sum == expected ? "YES" : "NO");
+        printf("[Reduce] Time        = %.4f sec\n", elapsed);
+    }
+
+    if (rank == 0) free(array);
+    free(local_chunk);
+    MPI_Finalize();
+    return 0;
+}
+
+3. COMPILATION & EXECUTION:
+--------------------------------------------------------------------------------
+Command:
+  mpicc -Wall -O2 -o sum_reduce sum_reduce.c
+  mpirun -np 4 ./sum_reduce
+
+Sample Output (4 processes):
+  Root filled array with values 1 to 1000000
+    Rank 0: summed indices [0, 250000) => local_sum = 31250125000
+    Rank 1: summed indices [250000, 500000) => local_sum = 93750125000
+    Rank 2: summed indices [500000, 750000) => local_sum = 156250125000
+    Rank 3: summed indices [750000, 1000000) => local_sum = 218750125000
+
+  [Reduce] Total sum   = 500000500000
+  [Reduce] Expected    = 500000500000
+  [Reduce] Correct?    = YES
+  [Reduce] Time        = 0.0018 sec
